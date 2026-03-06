@@ -9,9 +9,9 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -216,8 +216,7 @@ def format_docs(docs):
         parts.append(f"--- Source Chunk {i+1} (Page {page_num}) ---\n{doc.page_content}")
     return "\n\n".join(parts)
 
-
-RAG_TEMPLATE = """You are a highly detailed AI legal assistant. You must answer questions using ONLY the provided context from legal documents.
+RAG_SYSTEM_TEMPLATE = """You are a highly detailed AI legal assistant. You must answer questions using ONLY the provided context from legal documents.
 
 INSTRUCTIONS:
 1. Read ALL the context chunks carefully and thoroughly.
@@ -229,32 +228,54 @@ INSTRUCTIONS:
 7. Do NOT use any external knowledge. Only use what is explicitly stated in the context below.
 
 Context from the document:
-{context}
-
-Question: {question}
-
-Provide a complete and detailed answer:"""
+{context}"""
 
 
-def answer_question(question: str, vector_store) -> dict:
-    """Run RAG: retrieve → format → LLM → answer."""
-    retrieved_docs = vector_store.similarity_search(question, k=RETRIEVER_K)
+CONTEXTUALIZE_Q_SYSTEM_PROMPT = """Given a chat history and the latest user question \
+which might reference context in the chat history, formulate a standalone question \
+which can be understood without the chat history. Do NOT answer the question, \
+just reformulate it if needed and otherwise return it as is."""
 
-    if not retrieved_docs:
-        return {"answer": "Information not found in document", "sources": []}
 
-    context_text = format_docs(retrieved_docs)
-    prompt = PromptTemplate.from_template(RAG_TEMPLATE)
+def answer_question(question: str, vector_store, chat_history: list) -> dict:
+    """Run Conversational RAG: retrieve → format → LLM → answer."""
     llm = get_groq_llm()
-    chain = prompt | llm | StrOutputParser()
+    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
+
+    # 1. Create a history-aware retriever
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", CONTEXTUALIZE_Q_SYSTEM_PROMPT),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    # 2. Create the document chain (the actual Q&A logic)
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", RAG_SYSTEM_TEMPLATE),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+    # 3. Create the final retrieval chain
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
     try:
-        response = chain.invoke({"context": context_text, "question": question})
+        response = rag_chain.invoke({"input": question, "chat_history": chat_history})
     except Exception as e:
         logger.error(f"LLM error: {e}")
+        # Fallback to simple search if chain fails
+        retrieved_docs = vector_store.similarity_search(question, k=RETRIEVER_K)
         return {"answer": f"Error generating answer: {e}", "sources": retrieved_docs}
 
-    return {"answer": response.strip(), "sources": retrieved_docs}
+    return {"answer": response["answer"].strip(), "sources": response["context"]}
 
 
 # ─── UI ──────────────────────────────────────────────────────────
@@ -330,8 +351,17 @@ if prompt := st.chat_input("Ask a question about the uploaded document..."):
         st.session_state.messages.append({"role": "assistant", "content": err})
     else:
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                result = answer_question(prompt, st.session_state.vector_store)
+                # Format chat history for LangChain
+                from langchain_core.messages import HumanMessage, AIMessage
+                formatted_history = []
+                # Only pass the last 10 messages (5 turns) to save tokens
+                for msg in st.session_state.messages[-10:]:
+                    if msg["role"] == "user":
+                        formatted_history.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        formatted_history.append(AIMessage(content=msg["content"]))
+
+                result = answer_question(prompt, st.session_state.vector_store, formatted_history[:-1]) # exclude the current prompt
                 answer = result["answer"]
                 sources = result["sources"]
 
