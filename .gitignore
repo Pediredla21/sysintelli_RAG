@@ -1,0 +1,25 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data (FAISS index is ephemeral in cloud)
+data/faiss_index/
+
+# Secrets (NEVER commit real keys)
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/

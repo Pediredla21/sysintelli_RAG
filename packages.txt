@@ -1,0 +1,2 @@
+# System dependencies for Streamlit Community Cloud
+# (none needed for this app — all deps are pip-installable)
